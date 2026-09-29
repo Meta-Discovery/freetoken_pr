@@ -114,6 +114,7 @@ class MoELayer(BaseOP):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        overlap_fn=None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -126,10 +127,17 @@ class MoELayer(BaseOP):
         that.
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
-        shared branches that need the original input before calling this method.
+        shared branches that need the original input before calling this method, or
+        pass them as ``overlap_fn``: it runs before the expert kernel and its result is
+        added to the output, outside the all-reduce (e.g. a replicated shared expert).
         """
-        out = self._resident_gemm(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+        overlap_out = overlap_fn() if overlap_fn is not None else None
+        out = self._maybe_all_reduce(
+            self._resident_gemm(hidden_states, topk_weights, topk_ids)
+        )
+        if overlap_out is not None:
+            out = out + overlap_out
+        return out
 
     def forward(
         self,
@@ -206,6 +214,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        overlap_fn=None,
     ) -> torch.Tensor:
         """Expert compute for an externally computed routing decision (``TopK``).
 
@@ -215,14 +224,29 @@ class OffloadMoELayer(MoELayer):
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
 
         ``hidden_states`` may also be overwritten by the expert kernel. Compute
-        shared branches that need the original input before calling this method.
+        shared branches that need the original input before calling this method, or
+        pass them as ``overlap_fn`` (see ``MoELayer.routed_forward``); hybrid decode runs
+        it on the GPU while the CPU computes the overflow experts.
         """
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
-        else:
-            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-        return self._maybe_all_reduce(out)
+            overlap_out = overlap_fn() if overlap_fn is not None else None
+            out = self._maybe_all_reduce(
+                self._prefill_routed(hidden_states, topk_weights, topk_ids)
+            )
+            if overlap_out is not None:
+                out = out + overlap_out
+            return out
+        # Only fold it into the decode path at tp=1: at tp>1 it must stay outside the all-reduce.
+        fold = overlap_fn is not None and self.tp_size == 1
+        inner = overlap_fn if fold else None
+        overlap_out = overlap_fn() if overlap_fn is not None and not fold else None
+        out = self._maybe_all_reduce(
+            self._decode_routed(hidden_states, topk_weights, topk_ids, inner)
+        )
+        if overlap_out is not None:
+            out = out + overlap_out
+        return out
 
     def decode_forward(
         self,
@@ -263,6 +287,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        overlap_fn=None,
     ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
@@ -273,18 +298,22 @@ class OffloadMoELayer(MoELayer):
         (high RAM bandwidth) straight from the host banks: ship hidden/routing to
         pinned host memory, run the GEMV on the worker pool via host nodes, ship the
         result back. The GPU slot cache is untouched (topk_ids keep their raw expert
-        ids), so no ``ensure_experts``/``copy_missing`` here."""
+        ids), so no ``ensure_experts``/``copy_missing`` here. ``overlap_fn``: see
+        ``routed_forward``."""
         cache = self.offload_cache
         assert cache is not None
         if cache.is_cpu_layer(self.layer_id):
             executor = cache.cpu_executor
             assert executor is not None, "CPU MoE executor was not initialized"
-            return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            overlap_out = overlap_fn() if overlap_fn is not None else None
+            out = executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+            return out + overlap_out if overlap_out is not None else out
         if cache.decode_target == "hybrid":
-            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
+            return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids, overlap_fn)
+        overlap_out = overlap_fn() if overlap_fn is not None else None
         cache.ensure_experts(self.layer_id, topk_ids)
         cache.copy_missing()
-        return self._expert_gemm(
+        out = self._expert_gemm(
             cache,
             hidden_states,
             topk_weights,
@@ -294,6 +323,7 @@ class OffloadMoELayer(MoELayer):
             alphas=cache.alphas_for_slots(self.layer_id),
             is_prefill=False,
         )
+        return out + overlap_out if overlap_out is not None else out
 
     def _decode_hybrid(
         self,
@@ -301,6 +331,7 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
+        overlap_fn=None,
     ) -> torch.Tensor:
         """Hybrid decode: GPU computes cache hits + <=K freshly-fetched experts, the CPU
         computes the overflow misses, overlapped, then the partials merge.
@@ -310,6 +341,9 @@ class OffloadMoELayer(MoELayer):
         routing split is device-side elementwise and the CPU submit/sync are host nodes.
         Each route is computed exactly once -- the GPU weights are zeroed for CPU-assigned
         routes and the CPU ids are -1 for GPU-assigned routes (the C++ kernel skips id<0).
+
+        ``overlap_fn`` is enqueued right after the CPU submit, so it runs while the CPU
+        computes the overflow experts, and before the GEMM that may overwrite ``hidden_states``.
         """
         executor = cache.cpu_executor
         assert executor is not None, "CPU MoE executor was not initialized"
@@ -321,6 +355,7 @@ class OffloadMoELayer(MoELayer):
 
         cpu_ids = torch.where(on_gpu, raw.new_full((), -1), raw).contiguous()
         pending = executor.decode_submit(self.layer_id, hidden_states, topk_weights, cpu_ids)
+        overlap_out = overlap_fn() if overlap_fn is not None else None
 
         # Measurement knob: FREETOKEN_HYBRID_OVERLAP=0 syncs the CPU pool *before* the
         # PCIe fetch + GPU GEMM, serializing the two so an A/B isolates the overlap win.
@@ -342,7 +377,10 @@ class OffloadMoELayer(MoELayer):
             is_prefill=False,
         )
         cpu_routed = cpu_routed_early if not _HYBRID_OVERLAP else executor.decode_sync(pending)
-        return gpu_routed + cpu_routed
+        out = gpu_routed + cpu_routed
+        if overlap_out is not None:
+            out = out + overlap_out
+        return out
 
     def _prefill_routed(
         self,
