@@ -384,6 +384,53 @@ def test_offload_moe_layer_decode_forward_uses_remapped_slot_ids(monkeypatch):
 
 
 
+def test_routed_forward_overlap_fn_is_added_exactly_once(monkeypatch):
+    """overlap_fn's result must be added to the routed output exactly once (not dropped, not
+    double-counted). At tp=1 it folds into the decode path (passed as the inner arg); the final
+    output must equal the no-overlap output plus the overlap result. Verifies the PR-B contract
+    with a stubbed expert compute so only the routed_forward wiring is under test."""
+    from freetoken.layers import moe as moe_mod
+
+    layer, _ = _make_layer_and_cache()
+    topk_weights = torch.tensor([[0.7, 0.3]], dtype=torch.float32)
+    topk_ids = torch.tensor([[2, 1]], dtype=torch.int32)
+    hidden = torch.randn(1, 8)
+
+    class _Batch:
+        is_prefill = False
+
+    class _Ctx:
+        batch = _Batch()
+
+    monkeypatch.setattr(moe_mod, "get_global_ctx", lambda: _Ctx())
+    base = torch.randn(1, 8)
+
+    # Emulate the real _decode_routed contract: compute the experts, and if an inner overlap_fn
+    # was folded in (tp=1), add its result -- exactly what _expert_gemm/_decode_hybrid do.
+    def fake_decode_routed(hidden_states, tw, tid, overlap_fn=None):
+        out = base.clone()
+        if overlap_fn is not None:
+            out = out + overlap_fn()
+        return out
+
+    monkeypatch.setattr(layer, "_decode_routed", fake_decode_routed)
+    assert layer.tp_size == 1
+
+    overlap_val = torch.randn(1, 8)
+    calls = {"n": 0}
+
+    def overlap_fn():
+        calls["n"] += 1
+        return overlap_val
+
+    out_no = layer.routed_forward(hidden, topk_weights, topk_ids)
+    out_ov = layer.routed_forward(hidden, topk_weights, topk_ids, overlap_fn=overlap_fn)
+
+    torch.testing.assert_close(out_no, base)
+    torch.testing.assert_close(out_ov, base + overlap_val)  # added exactly once
+    assert calls["n"] == 1  # overlap_fn invoked once, not also outside the fold
+
+
 def test_lru_gpu_cache_assigns_unique_slots_for_large_miss_batch():
     import pytest
     from freetoken.moe.offload_cache import OffloadMoeCache

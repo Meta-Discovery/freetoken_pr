@@ -8,12 +8,76 @@ import triton.language as tl
 from flashlib.kernels.slot_cache import lru_ensure
 
 # Hybrid backend: which of a step's missing experts to fetch (when capped below the miss
-# count). "recency" (default) fetches the experts most-recently active before this step
-# (LRU on the expert -> prioritizes recurring misses, lowering the steady miss rate);
-# "lowest_id" fetches the smallest expert ids (the original, routing-blind heuristic).
-_HYBRID_FETCH_BY_RECENCY = (
-    os.getenv("FREETOKEN_HYBRID_FETCH", "recency").strip().lower() != "lowest_id"
-)
+# count). "multiplicity" (default, bs>=2) fetches the misses with the most tokens routed to them,
+# since a fetch costs one expert but saves one CPU route per token; bs=1 falls back to "recency"
+# (most-recently active misses). "lowest_id" fetches the smallest ids (routing-blind).
+_HYBRID_FETCH = os.getenv("FREETOKEN_HYBRID_FETCH", "multiplicity").strip().lower()
+_HYBRID_FETCH_BY_MULT = _HYBRID_FETCH == "multiplicity"
+_HYBRID_FETCH_BY_RECENCY = _HYBRID_FETCH not in ("lowest_id", "multiplicity")
+
+# Hybrid slot eviction at bs>=2: "lfu" (default) evicts the expert with the lowest decayed route
+# mass, keeping popular experts resident; "lru" evicts by timestamp. bs=1 always uses LRU.
+_HYBRID_EVICT = os.getenv("FREETOKEN_HYBRID_EVICT", "lfu").strip().lower()
+_HYBRID_EVICT_BY_LFU = _HYBRID_EVICT == "lfu"
+# Fraction bits of the fixed-point LFU route mass (cache.expert_freq), so the x7/8 decay also
+# applies to small counts.
+_LFU_FRAC_BITS = 8
+
+# Optional explicit bs>=2 override of the benched fetch fraction. Never replaces a fixed cap
+# (base_frac==0); unset/0 -> use the derived margin below.
+def _parse_frac_bs2(raw: str | None) -> float:
+    if not raw:
+        return 0.0
+    try:
+        v = float(raw)
+    except ValueError:
+        v = -1.0
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"FREETOKEN_HYBRID_FRAC_BS2 must be in [0, 1] (0 disables), got {raw!r}")
+    return v
+
+
+def _parse_margin(raw: str | None) -> float:
+    if not raw:
+        return 1.0  # default: no margin (keep the benched fraction) -- opt in per hardware
+    try:
+        v = float(raw)
+    except ValueError:
+        v = -1.0
+    if not 0.0 < v <= 1.0:
+        raise ValueError(f"FREETOKEN_HYBRID_BS2_MARGIN must be in (0, 1] (1 = no margin), got {raw!r}")
+    return v
+
+
+_HYBRID_FRAC_BS2 = _parse_frac_bs2(os.getenv("FREETOKEN_HYBRID_FRAC_BS2"))
+# The benched fraction f0 = pcie/(pcie+cpu) balances the bs=1 per-route CPU cost against the PCIe
+# copy. At bs>=2 it over-fetches: it ignores the GPU expert GEMV (serial after the copy), the CPU
+# dedup (each expert's weight read once for all its routed tokens), and the PCIe-saturation knee
+# above which the fetch path stalls -- all of which push the throughput-optimal fraction LOWER.
+# The optimum is hardware-specific (measured L40S ~0.10 vs f0 0.138; RTX PRO 6000 ~0.05 vs f0
+# 0.152), so no closed-form of the bandwidths predicts it. Off by default (margin 1.0 = raw f0,
+# behaviour unchanged) since it is a hardware-dependent lever; enable per deployment with
+# FREETOKEN_HYBRID_BS2_MARGIN=0.5, which halves f0 at bs>=2 and recovers most of the gain on the
+# GLM offload path without per-GPU tuning (L40S 0.069 ~= its 0.07 plateau; RTX 0.076 between its
+# 0.05 peak and 0.10). FREETOKEN_HYBRID_FRAC_BS2 instead pins an explicit fraction. bs=1 always
+# uses f0 (guard-safe, unchanged).
+_HYBRID_BS2_MARGIN = _parse_margin(os.getenv("FREETOKEN_HYBRID_BS2_MARGIN"))
+
+
+def _fetch_fraction_for(num_tokens: int, base_frac: float) -> float:
+    """Fetch fraction for this batch; ``base_frac`` == 0 means a fixed cap is in use, and bs=1
+    always keeps the benched ``base_frac``. At bs>=2: an explicit FRAC_BS2 override if set, else
+    the benched fraction scaled by the bs>=2 margin (default 0.5)."""
+    if base_frac <= 0.0 or num_tokens < 2:
+        return base_frac
+    if _HYBRID_FRAC_BS2 > 0.0:
+        return _HYBRID_FRAC_BS2
+    return base_frac * _HYBRID_BS2_MARGIN
+
+
+def _evict_by_lfu(num_tokens: int) -> bool:
+    """LFU eviction only at bs>=2; bs=1 keeps LRU."""
+    return _HYBRID_EVICT_BY_LFU and num_tokens >= 2
 
 
 def ensure_experts(cache, layer_id: int, expert_ids: torch.Tensor) -> None:
@@ -53,6 +117,8 @@ def ensure_experts_hybrid(
     the integer that makes the PCIe fetch and the CPU overflow compute finish closest to
     together. ``num_indices`` = capped fetch count (copy_missing); ``num_missing_full`` =
     pre-cap miss count (stats)."""
+    num_tokens = expert_ids.shape[0] if expert_ids.dim() >= 2 else 1
+    fetch_fraction = _fetch_fraction_for(num_tokens, fetch_fraction)
     # Q16 fixed point so the GPU kernel and the CPU reference cap identically (no float).
     frac_q16 = min(1 << 16, max(0, round(fetch_fraction * (1 << 16))))
     if not expert_ids.is_cuda:
@@ -94,12 +160,24 @@ def reset_cache(cache) -> None:
 
 
 
+def _fetch_flags(num_tokens: int) -> tuple[bool, bool]:
+    """(BY_RECENCY, BY_MULT) for this batch; at bs=1 every multiplicity is 1, so use recency."""
+    if _HYBRID_FETCH_BY_MULT and num_tokens >= 2:
+        return False, True
+    if _HYBRID_FETCH_BY_MULT:
+        return True, False
+    return _HYBRID_FETCH_BY_RECENCY, False
+
+
 def _ensure_experts_hybrid_gpu(
     cache, layer_id: int, expert_ids: torch.Tensor, max_fetch: int, frac_q16: int
 ) -> None:
     block_e = triton.next_power_of_2(cache.num_experts)
     block_c = triton.next_power_of_2(cache.cache_size)
     num_warps = 8 if block_c >= 2048 else 4
+    num_tokens = expert_ids.shape[0] if expert_ids.dim() >= 2 else 1
+    by_recency, by_mult = _fetch_flags(num_tokens)
+    by_lfu = _evict_by_lfu(num_tokens)
     _ensure_experts_hybrid_kernel[(1,)](
         expert_ids,
         cache.slot_for_id,
@@ -112,6 +190,7 @@ def _ensure_experts_hybrid_gpu(
         cache.num_indices,
         cache.num_missing_full,
         cache.expert_recency,
+        cache.expert_freq,
         layer_id,
         expert_ids.numel(),
         int(max_fetch),
@@ -120,7 +199,10 @@ def _ensure_experts_hybrid_gpu(
         cache.cache_size,
         BLOCK_E=block_e,
         BLOCK_C=block_c,
-        BY_RECENCY=_HYBRID_FETCH_BY_RECENCY,
+        BY_RECENCY=by_recency,
+        BY_MULT=by_mult,
+        BY_LFU=by_lfu,
+        LFU_FRAC_BITS=_LFU_FRAC_BITS,
         num_warps=num_warps,
     )
 
@@ -134,9 +216,11 @@ def _ensure_experts_hybrid_cpu(
     experts; overflow misses are rewritten to -1. With ``BY_RECENCY`` the fetch set is the
     most-recently-active misses (ties -> lower id); else the lowest ids."""
     seen = []
+    mult: dict[int, int] = {}
     for expert in expert_ids.view(-1).tolist():
         if expert not in seen:
             seen.append(expert)
+        mult[expert] = mult.get(expert, 0) + 1
 
     cache.active_mask.zero_()
     step = int(cache.step.item()) + 1
@@ -149,8 +233,18 @@ def _ensure_experts_hybrid_cpu(
         if slot != -1:
             cache.usage[slot] = step
 
+    num_tokens = expert_ids.shape[0] if expert_ids.dim() >= 2 else 1
+    by_recency, by_mult = _fetch_flags(num_tokens)
+    by_lfu = _evict_by_lfu(num_tokens)
+    if by_lfu:  # mirror the GPU kernel: decay all experts' freq by 1/8, then add this step's mass
+        row = cache.expert_freq[layer_id]
+        row -= (row >> 3)
+        for expert in seen:
+            row[expert] += mult[expert] << _LFU_FRAC_BITS
     missing = [e for e in seen if int(cache.slot_for_id[layer_id, e].item()) == -1]
-    if _HYBRID_FETCH_BY_RECENCY:
+    if by_mult:
+        missing.sort(key=lambda e: (-mult[e], e))
+    elif by_recency:
         rec = cache.expert_recency[layer_id].tolist()
         missing.sort(key=lambda e: (-rec[e], e))
     else:
@@ -164,21 +258,33 @@ def _ensure_experts_hybrid_cpu(
     cache.num_missing_full.fill_(len(missing))
     cache.num_indices.fill_(num_fetch)
 
-    usage = cache.usage.tolist()
+    # Mirrors the GPU kernel Phase 2: empty slots first, active owners and picked slots never.
+    BIG = 9223372036854775807
+    if by_lfu:
+        id_of = cache.id_of_slot.tolist()
+        ef = cache.expert_freq.view(-1).tolist()
+        active_fids = {layer_id * cache.num_experts + e for e in seen}
+        key = [
+            BIG if (id_of[s] in active_fids)
+            else (ef[id_of[s]] if id_of[s] >= 0 else -1)
+            for s in range(cache.cache_size)
+        ]
+    else:
+        key = cache.usage.tolist()
     for idx in range(num_fetch):
         expert = missing[idx]
-        victim = min(range(cache.cache_size), key=lambda s: (usage[s], s))
+        victim = min(range(cache.cache_size), key=lambda s: (key[s], s))
         old_id = int(cache.id_of_slot[victim].item())
         if old_id >= 0:
             cache.slot_for_id.view(-1)[old_id] = -1
         cache.id_of_slot[victim] = layer_id * cache.num_experts + expert
         cache.slot_for_id[layer_id, expert] = victim
         cache.usage[victim] = step
-        usage[victim] = step
+        key[victim] = BIG
         cache.evict_slots[idx] = victim
         cache.src_indices[idx] = expert  # layer-local row
 
-    if _HYBRID_FETCH_BY_RECENCY:
+    if by_recency or by_mult:
         for expert in seen:
             cache.expert_recency[layer_id, expert] = step
 
@@ -300,6 +406,7 @@ def _ensure_experts_hybrid_kernel(
     num_indices_ptr,
     num_missing_full_ptr,
     expert_recency_ptr,
+    expert_freq_ptr,
     layer_id,
     num_active,
     max_fetch,
@@ -309,6 +416,9 @@ def _ensure_experts_hybrid_kernel(
     BLOCK_E: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BY_RECENCY: tl.constexpr,
+    BY_MULT: tl.constexpr,
+    BY_LFU: tl.constexpr,
+    LFU_FRAC_BITS: tl.constexpr,
 ):
     """Capped-fetch timestamp-LRU (hybrid backend).
 
@@ -334,10 +444,21 @@ def _ensure_experts_hybrid_kernel(
     off_e = tl.arange(0, BLOCK_E)
     e_mask = off_e < num_experts
     is_active = tl.zeros((BLOCK_E,), dtype=tl.int1)
+    mult = tl.zeros((BLOCK_E,), dtype=tl.int32)  # tokens routing to each expert this step
     for i in tl.range(num_active):
         e = tl.load(expert_ids_ptr + i)
-        is_active = is_active | (off_e == e)
+        eq = off_e == e
+        is_active = is_active | eq
+        mult += eq.to(tl.int32)
     tl.store(active_mask_ptr + off_e, is_active.to(tl.int32), mask=e_mask)
+    # Decay by 1/8 per layer visit so experts that went cold age out instead of pinning slots.
+    if BY_LFU:
+        prev_f = tl.load(expert_freq_ptr + base + off_e, mask=e_mask, other=0)
+        decayed = prev_f - (prev_f >> 3)
+        tl.store(
+            expert_freq_ptr + base + off_e, decayed + (mult.to(tl.int64) << LFU_FRAC_BITS),
+            mask=e_mask,
+        )
     slot = tl.load(slot_for_id_ptr + base + off_e, mask=e_mask, other=-1)
     is_missing = is_active & (slot == -1) & e_mask
     num_missing = tl.sum(is_missing.to(tl.int32))
@@ -358,10 +479,14 @@ def _ensure_experts_hybrid_kernel(
     is_hit = is_active & (slot >= 0)
     tl.store(usage_ptr + slot, step, mask=is_hit)
 
-    # Fetch-selection priority: encode (recency desc, id asc) into one strictly-ordered
-    # score so argmax has no ties (rec deltas are multiples of num_experts; the id term
-    # spans only [0, num_experts), so it can only break exact-recency ties).
-    if BY_RECENCY:
+    # Fetch-selection priority: encode (key desc, id asc) into one strictly-ordered score so
+    # argmax has no ties (the id term spans only [0, num_experts), so it only breaks key ties).
+    if BY_MULT:
+        score = tl.where(
+            is_missing, mult.to(tl.int64) * num_experts + (num_experts - 1 - off_e),
+            -1152921504606846976,
+        ).to(tl.int64)
+    elif BY_RECENCY:
         rec = tl.load(expert_recency_ptr + base + off_e, mask=e_mask, other=-1).to(tl.int64)
         score = tl.where(
             is_missing, rec * num_experts + (num_experts - 1 - off_e), -1152921504606846976
@@ -369,23 +494,29 @@ def _ensure_experts_hybrid_kernel(
     else:
         missing_rank = tl.cumsum(is_missing.to(tl.int32)) - 1
 
-    # ---- Phase 2: evict victims by argmin(usage), only for the capped fetches ----
+    # ---- Phase 2: evict victims by argmin(usage), or argmin(owner freq) under LFU ----
     if num_fetch > 0:
         off_c = tl.arange(0, BLOCK_C)
         c_mask = off_c < cache_size
         oid = tl.load(id_of_slot_ptr + off_c, mask=c_mask, other=-1)
-        u = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
+        if BY_LFU:
+            # empty slots -> -1, evicted first
+            safe_oid = tl.where(oid >= 0, oid, 0)
+            f = tl.load(expert_freq_ptr + safe_oid, mask=c_mask & (oid >= 0), other=0).to(tl.int64)
+            key = tl.where(oid >= 0, f, -1)
+        else:
+            key = tl.load(usage_ptr + off_c, mask=c_mask, other=9223372036854775807).to(tl.int64)
         owner_active = c_mask & False
         for i in tl.range(num_active):
             ei = tl.load(expert_ids_ptr + i)
             owner_active = owner_active | (oid == base + ei)
-        u = tl.where(owner_active | (~c_mask), 9223372036854775807, u)
+        key = tl.where(owner_active | (~c_mask), 9223372036854775807, key)
         for i in tl.range(num_fetch):
-            victim = tl.argmin(u, axis=0).to(tl.int32)
+            victim = tl.argmin(key, axis=0).to(tl.int32)
             old_id = tl.sum(tl.where(off_c == victim, oid, 0))
             if old_id >= 0:
                 tl.store(slot_for_id_ptr + old_id, -1)
-            if BY_RECENCY:
+            if BY_MULT or BY_RECENCY:
                 e = tl.argmax(score, axis=0).to(tl.int32)
                 score = tl.where(off_e == e, -1152921504606846976, score)
             else:
@@ -395,7 +526,7 @@ def _ensure_experts_hybrid_kernel(
             tl.store(usage_ptr + victim, step)
             tl.store(evict_slots_ptr + i, victim)
             tl.store(src_indices_ptr + i, e)  # layer-local row
-            u = tl.where(off_c == victim, 9223372036854775807, u)
+            key = tl.where(off_c == victim, 9223372036854775807, key)
 
     # ---- Phase 3: rewrite expert_ids -> slot id (hit/fetched) or -1 (overflow -> CPU) ----
     for i in tl.range(num_active):
@@ -404,8 +535,9 @@ def _ensure_experts_hybrid_kernel(
         tl.store(expert_ids_ptr + i, s)
 
     # Bump every active expert's recency to this step (LRU on the expert): an overflow miss
-    # computed on the CPU now ranks high if it recurs, so it gets fetched next time.
-    if BY_RECENCY:
+    # computed on the CPU now ranks high if it recurs, so it gets fetched next time. BY_MULT
+    # keeps it current for its bs=1 recency fallback.
+    if BY_RECENCY or BY_MULT:
         step_vec = tl.zeros((BLOCK_E,), dtype=tl.int64) + step
         tl.store(expert_recency_ptr + base + off_e, step_vec, mask=is_active & e_mask)
 

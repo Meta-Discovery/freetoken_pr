@@ -199,6 +199,10 @@ class OffloadMoeCache:
         self.expert_recency = torch.full(
             (self.num_layers, self.num_experts), -1, dtype=torch.int64, device=self.device
         )
+        # hybrid only: per-(layer, expert) decayed route mass (fixed point), the LFU eviction key
+        self.expert_freq = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
         # Host source banks (one [num_experts, ...] tensor per layer, so layers can
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
@@ -509,6 +513,7 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.expert_freq.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -884,9 +889,10 @@ class OffloadMoeCache:
         from freetoken.moe.offload_kernels import reset_cache
 
         reset_cache(self)
-        # Per-expert recency is not cache_size-shaped, so reset_cache leaves it alone; wipe
-        # it here so a new sequence starts with cold hybrid fetch priorities.
+        # Per-expert recency/freq are not cache_size-shaped, so reset_cache leaves them alone;
+        # wipe here so a new sequence starts with cold hybrid fetch/eviction priorities.
         self.expert_recency.fill_(-1)
+        self.expert_freq.zero_()
 
     def reset_stats(self) -> None:
         self.prefill_hit_rows = 0

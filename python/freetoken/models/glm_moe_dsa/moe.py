@@ -82,10 +82,12 @@ class GlmMoeDsaSparseBlock(BaseOP):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         topk_weights, topk_ids = self._route(hidden_states)
-        # Routed kernels may overwrite hidden_states; shared experts need the original input.
-        shared = self.shared_experts.forward(hidden_states)
-        out = self.experts.routed_forward(hidden_states, topk_weights, topk_ids)
-        out = out + shared
+        # routed_forward runs the shared expert before any kernel that may overwrite
+        # hidden_states; hybrid decode overlaps it with the CPU experts.
+        out = self.experts.routed_forward(
+            hidden_states, topk_weights, topk_ids,
+            overlap_fn=lambda: self.shared_experts.forward(hidden_states),
+        )
         return out.view(num_tokens, hidden_dim)
 
 

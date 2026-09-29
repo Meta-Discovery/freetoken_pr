@@ -126,3 +126,133 @@ def test_hybrid_fixed_cap_unchanged():
     cache.ensure_experts_hybrid(0, ids)
     assert int(cache.num_missing_full.item()) == 8
     assert int(cache.num_indices.item()) == 1
+
+
+def test_frac_bs2_parse():
+    from freetoken.moe.offload_kernels import _parse_frac_bs2
+
+    assert _parse_frac_bs2(None) == 0.0
+    assert _parse_frac_bs2("") == 0.0
+    assert _parse_frac_bs2("0") == 0.0
+    assert _parse_frac_bs2("0.25") == 0.25
+    assert _parse_frac_bs2("1") == 1.0
+    for bad in ("-0.1", "1.5", "nan", "abc"):
+        with pytest.raises(ValueError):
+            _parse_frac_bs2(bad)
+
+
+def test_frac_bs2_only_replaces_a_benched_fraction(monkeypatch):
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FRAC_BS2", 0.1)
+    # explicit override at bs>=2 (takes precedence over the margin); bs=1 keeps the benched value
+    assert offload_kernels._fetch_fraction_for(8, 0.3) == 0.1
+    assert offload_kernels._fetch_fraction_for(1, 0.3) == 0.3
+    # no benched fraction (explicit --moe-hybrid-max-fetch / no profile): the fixed cap stays
+    assert offload_kernels._fetch_fraction_for(8, 0.0) == 0.0
+
+
+def test_parse_margin():
+    from freetoken.moe.offload_kernels import _parse_margin
+
+    assert _parse_margin(None) == 1.0   # default: no margin (opt in per hardware)
+    assert _parse_margin("") == 1.0
+    assert _parse_margin("0.5") == 0.5  # enable: halve the benched fraction at bs>=2
+    assert _parse_margin("0.25") == 0.25
+    for bad in ("0", "-0.1", "1.5", "abc"):
+        with pytest.raises(ValueError):
+            _parse_margin(bad)
+
+
+def test_bs2_margin_default_off_and_opt_in(monkeypatch):
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FRAC_BS2", 0.0)  # no explicit override
+    # default (margin 1.0): behaviour unchanged -- bs>=2 keeps the benched fraction
+    monkeypatch.setattr(offload_kernels, "_HYBRID_BS2_MARGIN", 1.0)
+    assert offload_kernels._fetch_fraction_for(8, 0.30) == 0.30
+    # opted in (margin 0.5): halved at bs>=2, bs=1 and fixed caps untouched
+    monkeypatch.setattr(offload_kernels, "_HYBRID_BS2_MARGIN", 0.5)
+    assert offload_kernels._fetch_fraction_for(8, 0.30) == 0.15
+    assert offload_kernels._fetch_fraction_for(2, 0.138) == 0.069
+    assert offload_kernels._fetch_fraction_for(1, 0.30) == 0.30
+    assert offload_kernels._fetch_fraction_for(8, 0.0) == 0.0
+
+
+def test_hybrid_fixed_cap_unchanged_at_bs2_with_frac_bs2(monkeypatch):
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FRAC_BS2", 0.1)
+    cache = OffloadMoeCache(
+        num_layers=1, num_experts=32, cache_size=40, device=torch.device("cpu"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=4,
+    )
+    ids = torch.arange(16, dtype=torch.int32).view(2, 8)
+    cache.ensure_experts_hybrid(0, ids)
+    assert int(cache.num_missing_full.item()) == 16
+    assert int(cache.num_indices.item()) == 4
+
+
+def test_lfu_decays_small_counts(monkeypatch):
+    # A once-hot expert must age out: with integer freq, freq - (freq >> 3) never decays a
+    # count below 8, so an expert routed by 7 tokens once would outrank one used last step.
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "_HYBRID_EVICT_BY_LFU", True)
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FRAC_BS2", 0.0)
+    cache = OffloadMoeCache(
+        num_layers=2, num_experts=4, cache_size=4, device=torch.device("cpu"),
+        quant_format="bf16", decode_target="hybrid", hybrid_max_fetch=4,
+    )
+    a, b, c, d = 0, 1, 2, 3
+
+    def step(layer, ids):
+        cache.ensure_experts_hybrid(layer, torch.tensor(ids, dtype=torch.int32).view(-1, 1))
+
+    step(0, [a] * 7)  # a: 7 routes, once
+    for _ in range(40):
+        step(0, [c, c])
+    step(0, [b, c])   # b: 1 route, last step
+    step(1, [a, a])   # fill the last slot from another layer
+    assert int((cache.id_of_slot >= 0).sum()) == 4
+    step(0, [d, c])   # d needs a slot: evict the stale a, keep the recent b
+    assert int(cache.slot_for_id[0, a]) == -1
+    assert int(cache.slot_for_id[0, b]) >= 0
+    assert int(cache.slot_for_id[0, d]) >= 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("fetch,evict", [("multiplicity", "lfu"), ("recency", "lru")])
+def test_hybrid_batched_gpu_matches_cpu_reference(monkeypatch, fetch, evict):
+    from freetoken.moe import offload_kernels
+
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FETCH_BY_MULT", fetch == "multiplicity")
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FETCH_BY_RECENCY", fetch == "recency")
+    monkeypatch.setattr(offload_kernels, "_HYBRID_EVICT_BY_LFU", evict == "lfu")
+    monkeypatch.setattr(offload_kernels, "_HYBRID_FRAC_BS2", 0.0)
+    monkeypatch.setattr(offload_kernels, "_HYBRID_BS2_MARGIN", 1.0)  # test parity at the raw fraction
+    torch.manual_seed(0)
+    num_experts, cache_size, top_k, frac = 32, 40, 8, 0.415
+
+    def make():
+        return OffloadMoeCache(
+            num_layers=2, num_experts=num_experts, cache_size=cache_size,
+            device=torch.device("cuda"), quant_format="bf16", decode_target="hybrid",
+            hybrid_max_fetch=num_experts, hybrid_fetch_fraction=frac,
+        )
+
+    gpu, ref = make(), make()
+    # skewed (without-replacement) routing so multiplicities differ and hot experts recur
+    popularity = torch.arange(num_experts, 0, -1, dtype=torch.float32) ** 2
+    for step in range(96):
+        bs = (1, 2, 8)[step % 3]  # mixed batch sizes exercise the bs=1 <-> bs>=2 switch
+        layer = step % 2
+        ids = torch.multinomial(popularity.expand(bs, -1), top_k).to(torch.int32)
+        g, c = ids.clone().cuda(), ids.clone()
+        gpu.ensure_experts_hybrid(layer, g)
+        ref.ensure_experts_hybrid(layer, c)
+        assert int(gpu.num_missing_full.item()) == int(ref.num_missing_full.item())
+        assert int(gpu.num_indices.item()) == int(ref.num_indices.item())
+        assert torch.equal(g.cpu(), c)
+        for name in ("slot_for_id", "id_of_slot", "usage", "expert_recency", "expert_freq"):
+            assert torch.equal(getattr(gpu, name).cpu(), getattr(ref, name).cpu()), name
