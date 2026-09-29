@@ -7,6 +7,9 @@ batch sizes (fp32-accumulate, so the only spread is reduction order -> tight tol
 Part 2 -- CUDA-graph capture/replay: the cudaLaunchHostFunc submit/sync host nodes
 end to end (eager decode, capture, replay with *new* data -> result tracks the new
 routing, i.e. the dependency flows through the pinned buffers, not baked-in).
+
+Part 3 -- the batched nvfp4 paths (expert dedup, multi-row dot) are bit-identical to
+the per-route path.
 """
 
 from __future__ import annotations
@@ -251,6 +254,47 @@ def test_stale_extension_rejected_for_swigluoai(monkeypatch):
         device=torch.device("cuda"),
     )
 
+
+@pytest.mark.parametrize("activation,limit", [("silu", None), ("swigluoai", 0.35), ("swiglu_clamp", 0.35)])
+@pytest.mark.parametrize("aoi", [False, True])
+@pytest.mark.parametrize("gpu_routes", [False, True])
+def test_cpu_decode_nvfp4_batched_paths_bit_identical(monkeypatch, activation, limit, aoi, gpu_routes):
+    """At 2 <= bs <= 64 nvfp4 decode dedups the routed experts and, on AVX2, computes several
+    tokens per weight row; both only reorder loops around the same dots, so the output must
+    match the per-route path bit for bit (id -1 = a route the GPU serves in hybrid decode)."""
+    from freetoken.moe.cpu_executor import CpuMoeExecutor
+
+    L, E, H, I, top_k = 1, 16, 272, 208, 8  # odd block counts (17, 13) hit the dot tails
+    dev = torch.device("cuda")
+    cache = _make_nvfp4_cache(L, E, H, I)
+
+    def make(dedup):
+        monkeypatch.setenv("FREETOKEN_CPU_MOE_DEDUP", "1" if dedup else "0")
+        return CpuMoeExecutor(
+            cache, top_k=top_k, activation=activation, apply_router_weight_on_input=aoi,
+            num_threads=4, max_tokens=64, device=dev, swiglu_limit=limit,
+        )
+
+    ref, fast = make(False), make(True)
+    g = torch.Generator().manual_seed(0)
+    popularity = torch.arange(E, 0, -1, dtype=torch.float32) ** 3  # shared hot experts
+    for bs in (2, 8, 64):
+        ids = torch.multinomial(popularity.expand(bs, -1), top_k, generator=g).to(torch.int32)
+        if gpu_routes:
+            ids[torch.rand(bs, top_k, generator=g) < 0.4] = -1
+        w = torch.rand(bs, top_k, generator=g)
+        hidden = (torch.randn(bs, H, generator=g) * 0.5).to(dev, torch.bfloat16)
+        ids, w = ids.to(dev), (w / w.sum(1, keepdim=True)).to(dev)
+        expect = ref.decode(0, hidden, w, ids)
+        torch.cuda.synchronize()
+        assert not ref._ext.dedup_active
+        assert torch.isfinite(expect.float()).all()
+        for mrow in (True, False):
+            fast._ext.set_mrow(mrow)
+            got = fast.decode(0, hidden, w, ids)
+            torch.cuda.synchronize()
+            assert fast._ext.dedup_active
+            assert torch.equal(got.view(torch.int16), expect.view(torch.int16)), (bs, mrow)
 
 def _pack_mxfp4_transposed(codes: torch.Tensor) -> torch.Tensor:
     """Pack [S, K, N] codes -> transposed blocks [S, K//2, N] (low nibble = even K)."""
