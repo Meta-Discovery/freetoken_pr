@@ -440,6 +440,35 @@ def test_triton_decode_marlin_matches_baseline_kernel():
 
 
 @cuda
+def test_triton_decode_marlin_skips_zero_weight_routes():
+    """Hybrid decode zeroes the weight of CPU-assigned routes; the marlin decode GEMV skips
+    their expert-weight read + GEMV and stores zeros. Since a zero-weight route contributes
+    nothing to the top-k sum, the output must still equal the dequant reference bit-for-class
+    -- i.e. the skip is lossless, including a token whose routes are all served elsewhere."""
+    from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_marlin
+
+    device = torch.device("cuda")
+    cache, ref_sources = _triton_cache(device)
+    torch.manual_seed(3)
+    M = 4
+    hidden = torch.randn(M, H, dtype=torch.bfloat16, device=device) / 4
+    topk_weights = torch.rand(M, TOPK, dtype=torch.float32, device=device)
+    topk_weights[0, 0] = 0.0          # one route of a token served elsewhere
+    topk_weights[2, 1] = 0.0          # the other route of a different token
+    topk_weights[3, :] = 0.0          # a whole token served elsewhere -> must be all-zero
+    ids = torch.randint(0, E, (M, TOPK), dtype=torch.int32, device=device)
+    ref = _ref_moe(ref_sources, 0, hidden, topk_weights, ids)
+    cache.ensure_experts(0, ids)
+    cache.copy_missing()
+    banks = cache.bank_views()
+    out = fused_experts_decode_nvfp4_marlin(
+        hidden, *banks, topk_weights, ids, "silu", False
+    )
+    _assert_close(out, ref)
+    assert torch.equal(out[3], torch.zeros_like(out[3]))  # fully-skipped token is exactly zero
+
+
+@cuda
 def test_b12x_decode_matches_dequant_reference():
     """sm_120 + CUDA>=13 only: the flashinfer b12x W4A16 fused MoE over the slot cache
     vs the dequant reference (skipped on hardware/toolkits where b12x cannot run)."""

@@ -180,6 +180,15 @@ def _decode_nvfp4_marlin_kernel(
     offs_n = n_block_id * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     n_mask = offs_n < N
 
+    # Hybrid decode zeroes the weight of CPU-assigned routes: skip their expert weight reads
+    # and GEMV, and store zeros so later stages never read uninitialized rows.
+    route_weight = tl.load(topk_weights_ptr + token_id * stride_tw_m + route_k * stride_tw_k)
+    if route_weight == 0.0:
+        c_skip = c_ptr + token_id * stride_cm + route_k * stride_ck + offs_n * stride_cn
+        tl.store(c_skip, tl.zeros([BLOCK_SIZE_N], dtype=tl.float32).to(compute_type),
+                 mask=(route_id < total_routes) & n_mask)
+        return
+
     slot = tl.load(topk_ids_ptr + token_id * stride_tid_m + route_k * stride_tid_k).to(tl.int64)
     a_row = route_id if A_ROW_IS_ROUTE else token_id
     a_base = a_ptr + a_row * stride_am
